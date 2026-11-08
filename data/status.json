@@ -1,0 +1,11 @@
+{
+ "updated": "2026-11-28T12:45:00.147085+00:00",
+ "price": 59195.0,
+ "oi_usd": 2114329367,
+ "positions": 20984,
+ "long_usd": 1019115743,
+ "short_usd": 1017783879,
+ "coverage_pct": 96.3,
+ "known_wallets": 133635,
+ "trades_last_15m": 1499
+}
