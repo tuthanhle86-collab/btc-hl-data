@@ -134,14 +134,21 @@ def commit():
 threading.Thread(target=ws_loop, daemon=True).start()
 if not positions: full_scan()
 last_full = time.time() if positions else 0
+full_thread = None
+def full_bg():
+    lst = list(dict.fromkeys(leaderboard() + sorted(known)))
+    scan(lst, rate=5)   # chạy nền, chừa 3 lệnh/giây cho vòng 15 phút
 while time.time() - T0 < RUN_SECONDS - 120:
     nxt = (time.time() // 900 + 1) * 900
-    if time.time() - last_full > 2 * 3600:
-        full_scan(); last_full = time.time()
-    else:
-        top = sorted(positions.values(), key=lambda p: -p["val"])[:600]
-        with lock: recent = [a for a, v in flow.items() if v[0] + v[1] >= 20000]
-        scan(list(dict.fromkeys([p["vi"] for p in top] + recent)), rate=8)
+    busy = full_thread is not None and full_thread.is_alive()
+    if not busy and time.time() - last_full > 2 * 3600:
+        full_thread = threading.Thread(target=full_bg, daemon=True); full_thread.start(); last_full = time.time(); busy = True
+    top = sorted(positions.values(), key=lambda p: -p["val"])[:600 if not busy else 300]
+    with lock: recent = [a for a, v in flow.items() if v[0] + v[1] >= 20000]
+    lst = list(dict.fromkeys([p["vi"] for p in top] + recent))
+    rate = 3 if busy else 8
+    lst = lst[:max(0, int((nxt - 20 - time.time()) * rate))]
+    scan(lst, rate=rate)
     time.sleep(max(0, nxt - time.time()))
     try: write_snapshot(); commit()
     except Exception as e: print("snapshot error", e, flush=True)
