@@ -95,6 +95,8 @@ def mark_price():
     i = [x["name"] for x in m["universe"]].index("BTC")
     return float(c[i]["markPx"]), float(c[i]["openInterest"]) * float(c[i]["markPx"])
 
+prev_set = set()   # (ví, chiều) có mặt ở ảnh chụp trước
+
 # ---------- writers ----------
 def write_snapshot():
     price, oi = mark_price()
@@ -102,13 +104,21 @@ def write_snapshot():
         P = list(positions.values())
         fl = dict(flow); flow.clear(); nt = ntrades[0]; ntrades[0] = 0
     now = time.time(); t15 = int(now // 900 * 900)
-    lq = defaultdict(lambda: [0.0, 0.0])
+    lq = defaultdict(lambda: [0.0, 0.0]); lqn = defaultdict(lambda: [0.0, 0.0])
+    cur = {(p["vi"], 1 if p["szi"] > 0 else -1) for p in P}
+    first = not prev_set
     for p in P:
         if p["liq"] and price * 0.9 < p["liq"] < price * 1.1:
-            lq[int(p["liq"] // 250 * 250)][0 if p["szi"] > 0 else 1] += p["val"]
+            b = int(p["liq"] // 250 * 250); j = 0 if p["szi"] > 0 else 1
+            lq[b][j] += p["val"]
+            if not first and (p["vi"], 1 if p["szi"] > 0 else -1) not in prev_set: lqn[b][j] += p["val"]
     L = sum(p["val"] for p in P if p["szi"] > 0); S = sum(p["val"] for p in P if p["szi"] < 0)
     snap = {"t": t15, "price": price, "oi": round(oi), "long": round(L), "short": round(S), "n": len(P),
-            "liq": {str(b): [round(v[0]), round(v[1])] for b, v in sorted(lq.items())}}
+            "liq": {str(b): [round(v[0]), round(v[1])] for b, v in sorted(lq.items())},
+            # P15 (10/11/2026): phần của vị thế mới xuất hiện so với ảnh chụp trước (ví mới hoặc vừa đảo chiều)
+            "n_new": (None if first else len(cur - prev_set)),
+            "liq_new": ({} if first else {str(b): [round(v[0]), round(v[1])] for b, v in sorted(lqn.items()) if v[0] + v[1] >= 1})}
+    prev_set.clear(); prev_set.update(cur)
     with open(f"{D}/liqsnap/{day(now)}.jsonl", "a") as f: f.write(json.dumps(snap) + "\n")
     # flow: one line per 15 min, wallet -> [buy, sell, n] (only wallets with >= 1,000 USD)
     rec = {"t": t15, "trades": nt, "w": {a: [round(v[0]), round(v[1]), v[2]] for a, v in fl.items() if v[0] + v[1] >= 1000},
