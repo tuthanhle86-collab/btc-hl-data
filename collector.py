@@ -96,6 +96,7 @@ def mark_price():
     return float(c[i]["markPx"]), float(c[i]["openInterest"]) * float(c[i]["markPx"])
 
 prev_set = set()   # (ví, chiều) có mặt ở ảnh chụp trước
+recent_traders = []   # ví giao dịch >= 20k trong 15 phút trước
 
 # ---------- writers ----------
 def write_snapshot():
@@ -103,6 +104,8 @@ def write_snapshot():
     with lock:
         P = list(positions.values())
         fl = dict(flow); flow.clear(); nt = ntrades[0]; ntrades[0] = 0
+        # P23 (12/11/2026): giữ lại ví vừa giao dịch >= 20k để vòng 15 phút kế tiếp quét lại vị thế
+        recent_traders[:] = [a for a, v in fl.items() if v[0] + v[1] >= 20000]
     now = time.time(); t15 = int(now // 900 * 900)
     lq = defaultdict(lambda: [0.0, 0.0]); lqn = defaultdict(lambda: [0.0, 0.0])
     cur = {(p["vi"], 1 if p["szi"] > 0 else -1) for p in P}
@@ -154,8 +157,9 @@ while time.time() - T0 < RUN_SECONDS - 120:
     if not busy and time.time() - last_full > 2 * 3600:
         full_thread = threading.Thread(target=full_bg, daemon=True); full_thread.start(); last_full = time.time(); busy = True
     top = sorted(positions.values(), key=lambda p: -p["val"])[:600 if not busy else 300]
-    with lock: recent = [a for a, v in flow.items() if v[0] + v[1] >= 20000]
-    lst = list(dict.fromkeys([p["vi"] for p in top] + recent))
+    with lock: recent = list(dict.fromkeys(list(recent_traders) + [a for a, v in flow.items() if v[0] + v[1] >= 20000]))
+    lst0 = list(dict.fromkeys(recent))
+    lst = list(dict.fromkeys([p["vi"] for p in top] + lst0))   # ví lớn trước, rồi ví vừa giao dịch
     rate = 3 if busy else 8
     lst = lst[:max(0, int((nxt - 20 - time.time()) * rate))]
     scan(lst, rate=rate)
