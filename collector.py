@@ -2,6 +2,7 @@
 - Ghi mọi giao dịch BTC qua websocket, gộp theo ví mỗi 15 phút -> data/flow/YYYYMMDD.jsonl.gz
 - Mỗi 15 phút: làm mới ~600 ví lớn nhất, chụp bản đồ thanh lý (khoảng 250 USD, ±10% giá) -> data/liqsnap/YYYYMMDD.jsonl
 - Mỗi 2 giờ: quét lại toàn bộ danh sách ví (top 5,000 bảng xếp hạng + ví đã thấy giao dịch BTC) -> data/positions.json.gz
+- Mỗi 15 phút: sổ lệnh Deribit+Kraken (khối 250 USD, ±3,000) và thanh lý OKX trong 15 phút -> data/cexsnap/YYYYMMDD.jsonl (P42)
 - Mỗi 15 phút ghi data/status.json và commit (amend, force push) lên nhánh data để kho không phình.
 """
 import json, gzip, os, time, threading, subprocess, urllib.request, datetime as dt
@@ -9,7 +10,7 @@ from collections import defaultdict
 import websocket
 
 RUN_SECONDS = float(os.environ.get("RUN_SECONDS", 5.75 * 3600))
-D = "data"; os.makedirs(D + "/flow", exist_ok=True); os.makedirs(D + "/liqsnap", exist_ok=True)
+D = "data"; os.makedirs(D + "/flow", exist_ok=True); os.makedirs(D + "/liqsnap", exist_ok=True); os.makedirs(D + "/cexsnap", exist_ok=True)
 API = "https://api.hyperliquid.xyz/info"
 lock = threading.Lock()
 T0 = time.time()
@@ -123,6 +124,8 @@ def write_snapshot():
             "liq_new": ({} if first else {str(b): [round(v[0]), round(v[1])] for b, v in sorted(lqn.items()) if v[0] + v[1] >= 1})}
     prev_set.clear(); prev_set.update(cur)
     with open(f"{D}/liqsnap/{day(now)}.jsonl", "a") as f: f.write(json.dumps(snap) + "\n")
+    try: write_cexsnap(t15, price)
+    except Exception as e: print("cexsnap error", e, flush=True)
     # flow: one line per 15 min, wallet -> [buy, sell, n] (only wallets with >= 1,000 USD)
     rec = {"t": t15, "trades": nt, "w": {a: [round(v[0]), round(v[1]), v[2]] for a, v in fl.items() if v[0] + v[1] >= 1000},
            "pos": {a: (round(positions[a]["szi"], 5) if a in positions else 0) for a in fl if fl[a][0] + fl[a][1] >= 1000}}
@@ -134,9 +137,52 @@ def write_snapshot():
                "known_wallets": len(known), "trades_last_15m": nt}, open(D + "/status.json", "w"), indent=1)
     # keep 8 days
     cutoff = day(now - 8 * 86400)
-    for sub in ["flow", "liqsnap"]:
+    for sub in ["flow", "liqsnap", "cexsnap"]:
         for fn in os.listdir(f"{D}/{sub}"):
             if fn[:8] < cutoff: os.remove(f"{D}/{sub}/{fn}")
+
+
+# ---------- P42 (16/11/2026): ảnh chụp sổ lệnh + thanh lý OKX mỗi 15 phút để chấm lại lệnh tự vào 21:00 ----------
+okx_last = [0]
+def http_json(u):
+    try:
+        with urllib.request.urlopen(urllib.request.Request(u, headers={"User-Agent": "btc-collector"}), timeout=15) as r: return json.load(r)
+    except Exception: return None
+def write_cexsnap(t15, price):
+    snap = {"t": t15, "price": price, "book": {}, "okx_liq": {}, "okx_ok": False}
+    ob = defaultdict(lambda: [0.0, 0.0])
+    d = http_json("https://www.deribit.com/api/v2/public/get_order_book?instrument_name=BTC-PERPETUAL&depth=10000")
+    if d and d.get("result"):
+        for p, a in d["result"]["bids"]: ob[int(p // 250 * 250)][0] += a / p
+        for p, a in d["result"]["asks"]: ob[int(p // 250 * 250)][1] += a / p
+    k = http_json("https://futures.kraken.com/derivatives/api/v3/orderbook?symbol=PF_XBTUSD")
+    if k and k.get("orderBook"):
+        for x in k["orderBook"]["bids"]: ob[int(x[0] // 250 * 250)][0] += x[1]
+        for x in k["orderBook"]["asks"]: ob[int(x[0] // 250 * 250)][1] += x[1]
+    snap["book"] = {str(b): [round(v[0], 1), round(v[1], 1)] for b, v in sorted(ob.items()) if abs(b - price) <= 3000}
+    lq = defaultdict(lambda: [0.0, 0.0]); since = okx_last[0] or (t15 - 900) * 1000; newest = since
+    ok = False
+    for fam, kind in (("BTC-USDT", "usdt"), ("BTC-USD", "usd")):
+        after = ""
+        for _ in range(10):
+            r = http_json(f"https://www.okx.com/api/v5/public/liquidation-orders?instType=SWAP&instFamily={fam}&state=filled&limit=100" + (f"&after={after}" if after else ""))
+            if not r or not r.get("data"): break
+            ok = True
+            dets = r["data"][0]["details"]
+            if not dets: break
+            stop = False
+            for x in dets:
+                ts = int(x["ts"])
+                if ts <= since: stop = True; break
+                newest = max(newest, ts); px = float(x["bkPx"]); sz = float(x["sz"])
+                usd = sz * 0.01 * px if kind == "usdt" else sz * 100
+                lq[int(px // 250 * 250)][0 if x["posSide"] == "long" else 1] += usd
+            if stop: break
+            after = dets[-1]["ts"]; time.sleep(0.15)
+    okx_last[0] = newest
+    snap["okx_ok"] = ok
+    snap["okx_liq"] = {str(b): [round(v[0]), round(v[1])] for b, v in sorted(lq.items())}
+    with open(f"{D}/cexsnap/{day(t15)}.jsonl", "a") as f: f.write(json.dumps(snap) + "\n")
 
 def commit():
     subprocess.run(["git", "add", "-A", D], check=False)
